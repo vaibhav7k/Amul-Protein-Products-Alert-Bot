@@ -17,13 +17,32 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
 from config import Config, USER_AGENTS, CATEGORY_URL
-from database import get_pincode_data, expire_subscriptions
 from utils import app_logger, user_activity_logger, send_consolidated_alert
 
 
+# --- Global Scraper Lock ---
+# Prevents concurrent scraper cycles which could cause duplicate alerts
+_scraper_lock = asyncio.Lock()
+
+
+# --- Product Name Cleaning ---
+def clean_product_name(title: str) -> str:
+    """Clean up product names by removing unnecessary prefixes."""
+    # Remove "Amul " prefix variations
+    for prefix in ["Amul Protein ", "Amul "]:
+        if title.startswith(prefix):
+            title = title[len(prefix):]
+    
+    # Remove trailing "At Best Price" or similar
+    title = title.replace(" - At Best Price", "").replace(" At Best Price", "")
+    
+    # Return cleaned title with max 50 chars for brevity
+    return title.strip()[:50]
+
+
 # --- Global State ---
-# Key: (product_url, pincode), Value: 'stock' or 'sold'
-product_status_seen: Dict[Tuple[str, str], str] = {}
+# Product status is now persisted in database (product_status_cache table)
+# No in-memory state needed - database provides persistence across bot restarts
 
 
 def setup_driver() -> Optional[webdriver.Chrome]:
@@ -31,7 +50,7 @@ def setup_driver() -> Optional[webdriver.Chrome]:
     app_logger.info("Setting up new WebDriver instance...")
     
     if not Config.CHROME_BINARY_PATH or not Config.CHROMEDRIVER_PATH:
-        app_logger.error("Chrome paths not found in config.")
+        app_logger.error("❌ Chrome paths not configured. Check GOOGLE_CHROME_BIN and CHROMEDRIVER_PATH in .env")
         return None
     
     options = Options()
@@ -50,9 +69,17 @@ def setup_driver() -> Optional[webdriver.Chrome]:
     
     try:
         driver = webdriver.Chrome(service=service, options=options)
+        app_logger.info("✅ WebDriver initialized successfully")
         return driver
+    except FileNotFoundError as e:
+        app_logger.error(f"❌ WebDriver setup FAILED - File not found: {e}")
+        app_logger.error(f"   Chrome Binary: {Config.CHROME_BINARY_PATH}")
+        app_logger.error(f"   ChromeDriver: {Config.CHROMEDRIVER_PATH}")
+        return None
     except Exception as e:
-        app_logger.error(f"Failed to set up WebDriver: {e}")
+        app_logger.error(f"❌ WebDriver setup FAILED - {type(e).__name__}: {e}")
+        import traceback
+        app_logger.error(f"   Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -64,6 +91,23 @@ def _wait_for_page_load(driver: webdriver.Chrome, timeout=10):
         )
     except TimeoutException:
         pass
+
+
+async def is_during_quiet_hours(chat_id: int) -> bool:
+    """Check if current time is within user's quiet hours."""
+    from datetime import datetime
+    from async_db import get_quiet_hours
+    from time_helpers import get_current_time_only, is_between_times
+    
+    quiet_start, quiet_end = await get_quiet_hours(chat_id)
+    if not quiet_start or not quiet_end:
+        return False
+    
+    now = get_current_time_only()
+    start = datetime.strptime(quiet_start, "%H:%M:%S").time()
+    end = datetime.strptime(quiet_end, "%H:%M:%S").time()
+    
+    return is_between_times(now, start, end)
 
 
 def _change_pincode(
@@ -177,6 +221,22 @@ def _change_pincode(
         return current_pincode or "unknown"
 
 
+def is_driver_healthy(driver: webdriver.Chrome) -> bool:
+    """
+    Check if WebDriver instance is still responsive.
+    
+    Returns:
+        bool: True if driver is healthy, False if it needs restart
+    """
+    try:
+        # Try a simple command to see if driver responds
+        driver.execute_script("return true;")
+        return True
+    except Exception as e:
+        app_logger.warning(f"⚠️ Driver health check failed: {type(e).__name__}")
+        return False
+
+
 def scrape_category_page(
     driver: webdriver.Chrome, 
     pincode: str,
@@ -186,6 +246,11 @@ def scrape_category_page(
     Scrapes the protein category page.
     """
     wait = WebDriverWait(driver, 30) # 30s Timeout
+    
+    # 0. Health Check
+    if not is_driver_healthy(driver):
+        app_logger.error(f"❌ Driver is unhealthy. Forcing restart on next cycle.")
+        return [], [], None  # None signals _do_scraper_cycle to restart driver
     
     # 1. Navigate
     if driver.current_url != CATEGORY_URL:
@@ -199,8 +264,9 @@ def scrape_category_page(
         current_browser_pincode = _change_pincode(driver, wait, pincode, current_browser_pincode)
         
         if current_browser_pincode != pincode:
-            app_logger.warning(f"Skipping scrape: Pincode mismatch. Wanted {pincode}, got {current_browser_pincode}")
-            return [], [], current_browser_pincode
+            app_logger.error(f"❌ Pincode mismatch - expected {pincode}, got {current_browser_pincode}. Restarting driver.")
+            # Force driver restart by returning None for pincode
+            return [], [], None
 
     # 3. Wait for Grid
     try:
@@ -245,76 +311,387 @@ def scrape_category_page(
 
 async def run_scraper_cycle() -> None:
     """Run one complete scraper cycle for all pincodes."""
-    pincode_to_chat_ids = get_pincode_data()
-    unique_pincodes = list(pincode_to_chat_ids.keys())
-    
-    if not unique_pincodes:
-        app_logger.info("No active subscribers.")
-        return
+    async with _scraper_lock:
+        await _do_scraper_cycle()
 
-    driver = setup_driver()
-    if not driver:
-        return
+
+async def _do_scraper_cycle() -> None:
+    """Internal scraper implementation with lock held."""
+    from async_db import (
+        get_pincode_data,
+        get_product_status,
+        set_product_status,
+        store_pending_alerts,
+        has_cached_products_for_pincode,
+    )
     
-    current_browser_pincode: Optional[str] = None
-    
+    driver = None
     try:
+        pincode_to_chat_ids = await get_pincode_data()
+        unique_pincodes = list(pincode_to_chat_ids.keys())
+        
+        if not unique_pincodes:
+            app_logger.info("No active subscribers.")
+            return
+        
+        app_logger.info(f"🔍 Found {len(unique_pincodes)} active pincodes with subscribers: {unique_pincodes}")
+
+        driver = setup_driver()
+        if not driver:
+            app_logger.error("❌ Could not initialize WebDriver. Skipping this cycle.")
+            return
+        
+        current_browser_pincode: Optional[str] = None
+        
         for pincode in unique_pincodes:
             app_logger.info(f"--- Checking {pincode} ---")
             
             current_in_stock, current_sold_out, new_pincode = scrape_category_page(
                 driver, pincode, current_browser_pincode
             )
+            
+            # If new_pincode is None, driver needs restart
+            if new_pincode is None:
+                app_logger.warning(f"Driver state compromised, restarting for next pincode...")
+                if driver:
+                    driver.quit()
+                driver = setup_driver()
+                if not driver:
+                    app_logger.error("❌ Failed to restart WebDriver. Skipping cycle.")
+                    return
+                current_browser_pincode = None
+                continue  # Skip this pincode, try next one with fresh driver
+            
             current_browser_pincode = new_pincode
             
-            # Change Detection Logic
+            # Clean product names and prepare lists
+            clean_in_stock = [(clean_product_name(title), url) for title, url in current_in_stock]
+            clean_sold_out = [(clean_product_name(title), url) for title, url in current_sold_out]
+            
+            # Check if this is the FIRST TIME we're scraping this pincode
+            is_first_scrape = not await has_cached_products_for_pincode(pincode)
+            app_logger.info(f"First-time scrape for {pincode}? {is_first_scrape}")
+            
+            # Change Detection Logic (using database for state)
             has_change = False
             
             # Check In Stock
-            for title, url in current_in_stock:
-                key = (url, pincode)
-                if product_status_seen.get(key) != "stock":
-                    has_change = True
-                    product_status_seen[key] = "stock"
+            in_stock_count = len(clean_in_stock)
+            stock_changes = 0
+            for title, url in clean_in_stock:
+                cached_status = await get_product_status(url, pincode)
+                if cached_status != "stock":
+                    # Alert on status change OR on first scrape
+                    if is_first_scrape or cached_status != None:
+                        has_change = True
+                        stock_changes += 1
+                        change_type = "first-discovery" if is_first_scrape else "status-change"
+                        app_logger.debug(f"  In-stock {change_type}: {title[:30]}... (was: {cached_status}, now: stock)")
+                    await set_product_status(url, pincode, "stock")
             
             # Check Sold Out
-            for title, url in current_sold_out:
-                key = (url, pincode)
-                if product_status_seen.get(key) != "sold":
-                    product_status_seen[key] = "sold"
+            sold_count = len(clean_sold_out)
+            sold_changes = 0
+            for title, url in clean_sold_out:
+                cached_status = await get_product_status(url, pincode)
+                if cached_status != "sold":
+                    # Only alert if status changed (was stock before, now sold)
+                    if cached_status == "stock":
+                        has_change = True
+                        sold_changes += 1
+                        app_logger.debug(f"  Sold-out change detected: {title[:30]}... (was: {cached_status}, now: sold)")
+                    await set_product_status(url, pincode, "sold")
 
             # Alert
             if has_change:
-                app_logger.info(f"Alerting {pincode}...")
+                app_logger.info(f"✅ Changes detected for {pincode}: {stock_changes} in-stock, {sold_changes} sold-out | {in_stock_count} total in stock, {sold_count} sold out")
                 chat_ids = pincode_to_chat_ids.get(pincode, [])
+                app_logger.info(f"   Notifying {len(chat_ids)} users: {chat_ids}")
                 for chat_id in chat_ids:
-                    send_consolidated_alert(chat_id, pincode, current_in_stock, current_sold_out)
+                    # Check if user is in quiet hours
+                    if await is_during_quiet_hours(chat_id):
+                        # Store in pending_alerts instead of sending immediately
+                        await store_pending_alerts(chat_id, pincode, clean_in_stock, clean_sold_out)
+                        app_logger.info(f"   └─ User {chat_id} in quiet hours - alert queued")
+                    else:
+                        send_consolidated_alert(chat_id, pincode, clean_in_stock, clean_sold_out)
+                        app_logger.info(f"   └─ User {chat_id} sent immediate alert")
             else:
-                app_logger.info(f"No changes for {pincode}.")
+                app_logger.info(f"📊 No changes for {pincode} (checked {in_stock_count} in-stock, {sold_count} sold-out products)")
             
             await asyncio.sleep(random.uniform(2, 5))
                 
+    except Exception as e:
+        app_logger.error(f"❌ Unexpected error in scraper cycle: {type(e).__name__}: {e}")
+        import traceback
+        app_logger.error(f"   Traceback: {traceback.format_exc()}")
     finally:
+        # Clean up old cache to keep database lean (keep 14 days of history)
+        try:
+            from async_db import clear_old_product_cache
+            deleted_count = await clear_old_product_cache(days=14)
+            if deleted_count > 0:
+                app_logger.info(f"🧹 Cleaned up {deleted_count} old product cache entries")
+        except Exception as e:
+            app_logger.warning(f"⚠️ Error cleaning product cache: {e}")
+        
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception as e:
+                app_logger.warning(f"⚠️ Error closing WebDriver: {e}")
 
 
 async def check_subscriptions_expiry() -> None:
-    expired_count = expire_subscriptions()
-    if expired_count > 0:
-        user_activity_logger.info(f"{expired_count} subscriptions expired.")
+    """Check and expire subscriptions due date."""
+    from async_db import expire_subscriptions
+    
+    try:
+        expired_count = await expire_subscriptions()
+        if expired_count > 0:
+            user_activity_logger.info(f"✅ {expired_count} subscriptions expired and notified.")
+    except Exception as e:
+        app_logger.error(f"❌ Error checking subscription expiry: {e}", exc_info=True)
+
+
+async def validate_db_connection_pool() -> None:
+    """Periodically validate database connection pool health."""
+    from async_db import validate_connection_pool
+    
+    while True:
+        try:
+            # Check pool health every 60 seconds
+            is_healthy = await validate_connection_pool()
+            if not is_healthy:
+                app_logger.warning("⚠️ Connection pool was reinitialized due to health check failure")
+            await asyncio.sleep(60)
+        except Exception as e:
+            app_logger.error(f"❌ Error in connection pool validation: {e}", exc_info=True)
+            await asyncio.sleep(60)
 
 
 async def scheduler() -> None:
-    await check_subscriptions_expiry()
-    next_expiry_check = time.time() + Config.EXPIRY_CHECK_INTERVAL_SECONDS
+    """Main scheduler loop - runs scraper cycles and subscription checks."""
+    app_logger.info("🚀 Scheduler started")
+    
+    # Track all child tasks
+    child_tasks = []
+    
+    try:
+        # Validate config values before using them
+        expiry_check_interval = Config.EXPIRY_CHECK_INTERVAL_SECONDS
+        check_interval = Config.CHECK_INTERVAL_SECONDS
+        retry_delay = Config.RETRY_DELAY_SECONDS
+        
+        if not isinstance(expiry_check_interval, int) or expiry_check_interval <= 0:
+            app_logger.warning(f"Invalid EXPIRY_CHECK_INTERVAL_SECONDS: {expiry_check_interval}, using default 86400")
+            expiry_check_interval = 86400
+        if not isinstance(check_interval, int) or check_interval <= 0:
+            app_logger.warning(f"Invalid CHECK_INTERVAL_SECONDS: {check_interval}, using default 300")
+            check_interval = 300
+        if not isinstance(retry_delay, int) or retry_delay <= 0:
+            app_logger.warning(f"Invalid RETRY_DELAY_SECONDS: {retry_delay}, using default 5")
+            retry_delay = 5
+        
+        await check_subscriptions_expiry()
+        next_expiry_check = time.time() + expiry_check_interval
+        
+        # Start background digest tasks and store them
+        child_tasks.append(asyncio.create_task(send_hourly_digests()))
+        child_tasks.append(asyncio.create_task(send_daily_digests()))
+        child_tasks.append(asyncio.create_task(check_expired_pauses()))
+        child_tasks.append(asyncio.create_task(validate_db_connection_pool()))
+        app_logger.info(f"✅ Started {len(child_tasks)} background tasks")
+        
+        while True:
+            try:
+                await run_scraper_cycle()
+                
+                if time.time() > next_expiry_check:
+                    await check_subscriptions_expiry()
+                    next_expiry_check = time.time() + expiry_check_interval
+                
+                app_logger.info(f"⏳ Next check in {check_interval}s...")
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                app_logger.info("⚠️ Scheduler interrupted, cancelling child tasks...")
+                for task in child_tasks:
+                    if not task.done():
+                        task.cancel()
+                raise
+            except Exception as e:
+                app_logger.error(f"❌ Scheduler error: {type(e).__name__}: {e}")
+                await asyncio.sleep(retry_delay)
+    finally:
+        # Ensure all child tasks are cancelled on exit
+        for task in child_tasks:
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.gather(*child_tasks, return_exceptions=True)
+        except Exception:
+            pass
+        app_logger.info("🛑 Scheduler stopped")
+
+
+async def send_hourly_digests() -> None:
+    """Send hourly digest to users who opted in."""
+    from async_db import (
+        get_users_by_alert_frequency,
+        get_pending_alerts,
+        mark_alerts_sent,
+    )
+    from utils import send_telegram_message
     
     while True:
-        await run_scraper_cycle()
-        
-        if time.time() > next_expiry_check:
-            await check_subscriptions_expiry()
-            next_expiry_check = time.time() + Config.EXPIRY_CHECK_INTERVAL_SECONDS
-        
-        app_logger.info(f"Waiting {Config.CHECK_INTERVAL_SECONDS}s...")
-        await asyncio.sleep(Config.CHECK_INTERVAL_SECONDS)
+        try:
+            app_logger.info("📧 Starting hourly digest task...")
+            hourly_users = await get_users_by_alert_frequency("hourly")
+            
+            for chat_id in hourly_users:
+                try:
+                    alerts = await get_pending_alerts(chat_id)
+                    if alerts:
+                        # Build message from pending alerts
+                        message_parts = ["📊 *Hourly Digest* 📊"]
+                        for product_title, product_url, status in alerts:
+                            emoji = "✅" if status == "stock" else "❌"
+                            message_parts.append(f"{emoji} [{product_title}]({product_url})")
+                        
+                        message = "\n".join(message_parts)
+                        
+                        # Retry logic with exponential backoff
+                        sent = False
+                        for attempt in range(3):
+                            try:
+                                if send_telegram_message(chat_id, message):
+                                    await mark_alerts_sent(chat_id)
+                                    app_logger.info(f"📧 Hourly digest sent to {chat_id}")
+                                    sent = True
+                                    break
+                                else:
+                                    # API returned False but no exception
+                                    await asyncio.sleep(2 ** attempt)
+                            except Exception as retry_error:
+                                if attempt < 2:  # Not last attempt
+                                    wait_time = 2 ** attempt
+                                    app_logger.warning(f"Retry {attempt+1}/3 for user {chat_id} after {wait_time}s: {retry_error}")
+                                    await asyncio.sleep(wait_time)
+                                else:
+                                    raise
+                        
+                        if not sent:
+                            app_logger.error(f"Failed to send hourly digest to {chat_id} after 3 attempts")
+                except Exception as e:
+                    app_logger.error(f"Error sending hourly digest to {chat_id}: {e}")
+            
+            # Wait 1 hour before next digest
+            await asyncio.sleep(3600)
+        except Exception as e:
+            app_logger.error(f"Error in hourly digest task: {e}")
+            await asyncio.sleep(600)  # Retry after 10 min on error
+
+
+async def send_daily_digests() -> None:
+    """Send daily digest at 8 AM to users who opted in."""
+    from datetime import datetime
+    from async_db import (
+        get_users_by_alert_frequency,
+        get_pending_alerts,
+        mark_alerts_sent,
+    )
+    from utils import send_telegram_message
+    from time_helpers import get_current_time
+    
+    while True:
+        try:
+            now = get_current_time()
+            # Check if we're between 8:00 and 8:05
+            if now.hour == 8 and now.minute < 5:
+                app_logger.info("📄 Starting daily digest task at 8 AM...")
+                daily_users = await get_users_by_alert_frequency("daily")
+                
+                for chat_id in daily_users:
+                    try:
+                        alerts = await get_pending_alerts(chat_id)
+                        if alerts:
+                            # Build message from pending alerts
+                            message_parts = ["📋 *Daily Digest* 📋"]
+                            for product_title, product_url, status in alerts:
+                                emoji = "✅" if status == "stock" else "❌"
+                                message_parts.append(f"{emoji} [{product_title}]({product_url})")
+                            
+                            message = "\n".join(message_parts)
+                            
+                            # Retry logic with exponential backoff
+                            sent = False
+                            for attempt in range(3):
+                                try:
+                                    if send_telegram_message(chat_id, message):
+                                        await mark_alerts_sent(chat_id)
+                                        app_logger.info(f"📄 Daily digest sent to {chat_id}")
+                                        sent = True
+                                        break
+                                    else:
+                                        # API returned False but no exception
+                                        await asyncio.sleep(2 ** attempt)
+                                except Exception as retry_error:
+                                    if attempt < 2:  # Not last attempt
+                                        wait_time = 2 ** attempt
+                                        app_logger.warning(f"Retry {attempt+1}/3 for user {chat_id} after {wait_time}s: {retry_error}")
+                                        await asyncio.sleep(wait_time)
+                                    else:
+                                        raise
+                            
+                            if not sent:
+                                app_logger.error(f"Failed to send daily digest to {chat_id} after 3 attempts")
+                    except Exception as e:
+                        app_logger.error(f"Error sending daily digest to {chat_id}: {e}")
+                
+                # Wait until after 8:05 to avoid duplicate sends
+                await asyncio.sleep(600)
+            else:
+                # Check again in 1 minute
+                await asyncio.sleep(60)
+        except Exception as e:
+            app_logger.error(f"Error in daily digest task: {e}")
+            await asyncio.sleep(600)
+
+
+async def check_expired_pauses() -> None:
+    """Check and auto-resume users whose pause period has expired."""
+    from datetime import date
+    from async_db import (
+        get_paused_users,
+        get_pause_until_date,
+        resume_user_subscription,
+    )
+    from utils import send_telegram_message
+    
+    while True:
+        try:
+            paused_users = await get_paused_users()
+            today = date.today()
+            
+            for chat_id in paused_users:
+                try:
+                    pause_until = await get_pause_until_date(chat_id)
+                    if pause_until and today >= pause_until:
+                        await resume_user_subscription(chat_id)
+                        app_logger.info(f"✅ Auto-resumed user {chat_id}")
+                        
+                        try:
+                            send_telegram_message(
+                                chat_id,
+                                "✅ *Welcome Back!*\n\nYour subscription is active again. You'll start receiving alerts."
+                            )
+                        except:
+                            pass
+                except Exception as e:
+                    app_logger.error(f"Error checking pause expiry for {chat_id}: {e}")
+            
+            # Check once per day at midnight
+            await asyncio.sleep(86400)
+        except Exception as e:
+            app_logger.error(f"Error in pause expiry check: {e}")
+            await asyncio.sleep(600)

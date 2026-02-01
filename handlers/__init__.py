@@ -11,6 +11,12 @@ from handlers.user import (
     rules_command,
     dm_command,
     help_command,
+    pause_command,
+    resume_command,
+    preferences_command,
+    alert_settings_command,
+    quiet_hours_command,
+    getalert_command,
 )
 
 from handlers.admin import (
@@ -36,6 +42,12 @@ __all__ = [
     'rules_command',
     'dm_command',
     'help_command',
+    'pause_command',
+    'resume_command',
+    'preferences_command',
+    'alert_settings_command',
+    'quiet_hours_command',
+    'getalert_command',
     # Admin handlers
     'auto_approve_command',
     'settings_command',

@@ -13,3 +13,5 @@ psycopg2-binary>=2.9.9
 
 # Environment Variables
 python-dotenv>=1.0.0
+
+pytz>=2023.3

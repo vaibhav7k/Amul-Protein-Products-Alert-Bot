@@ -11,6 +11,27 @@ A powerful Telegram bot that monitors Amul Shop product availability and sends r
 
 ---
 
+## 🎉 NEW FEATURES - Core Features v1.0 (31 Jan 2026)
+
+✨ **Three Major Features Just Launched:**
+
+### ✅ Pause/Resume Subscriptions
+Users can pause their subscription for 7, 14, or 30 days without losing their account.
+- Command: `/pause` - Pause subscription with duration options
+- Command: `/resume` - Resume paused subscription
+
+### ✅ Product Preferences
+Users select which products they want to track and only receive alerts for those products.
+- Command: `/preferences` - Select products in interactive grid
+
+### ✅ Alert Frequency Control
+Users choose how they receive alerts: instant, hourly digest, or daily digest with quiet hours support.
+- Command: `/alertsettings` - Configure delivery frequency and quiet hours
+
+**📚 Full Documentation**: See [CORE_FEATURES_IMPLEMENTATION.md](CORE_FEATURES_IMPLEMENTATION.md) for complete details.
+
+---
+
 ## 📸 Screenshots
 
 <p align="center">

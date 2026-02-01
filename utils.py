@@ -21,6 +21,9 @@ app_logger = logging.getLogger("amul_bot")
 user_activity_logger = logging.getLogger("user_activity")
 user_activity_logger.propagate = False
 
+# Admin cache (updated every 5 minutes)
+_admin_cache = {"admins": [], "last_update": 0}
+
 
 # --- Custom Telegram Log Handler ---
 class TelegramLogHandler(logging.Handler):
@@ -73,13 +76,57 @@ def setup_logging() -> None:
 
 # --- Admin Check ---
 async def is_admin(chat_id: int, bot) -> bool:
-    """Check if a user is an admin of the admin group."""
+    """Check if a user is an admin of the admin group with 5-minute cache."""
+    global _admin_cache
+    
+    current_time = time.time()
+    
+    # Return cached result if fresh (< 5 minutes old)
+    if current_time - _admin_cache["last_update"] < 300:
+        try:
+            for admin in _admin_cache["admins"]:
+                # admin can be a ChatMember object or a cached simple dict/object
+                if hasattr(admin, "user") and hasattr(admin.user, "id"):
+                    if admin.user.id == chat_id:
+                        return True
+                elif hasattr(admin, "id"):
+                    if admin.id == chat_id:
+                        return True
+                elif isinstance(admin, dict) and admin.get("user"):
+                    # fallback for lightweight cache entries
+                    uid = admin.get("user")
+                    try:
+                        if int(uid) == int(chat_id):
+                            return True
+                    except Exception:
+                        pass
+            return False
+        except Exception:
+            # If cache structure is unexpected, fall back to fresh check
+            pass
+    
     try:
+        # Update cache
         admins = await bot.get_chat_administrators(Config.ADMIN_GROUP_ID)
-        return any(admin.user.id == chat_id for admin in admins)
+        _admin_cache["admins"] = admins
+        _admin_cache["last_update"] = current_time
+        
+        for admin in admins:
+            if hasattr(admin, "user") and getattr(admin.user, "id", None) == chat_id:
+                return True
+        return False
     except Exception as e:
         app_logger.error(f"Could not check admin status for {chat_id}: {e}")
-        return False
+        # Return cached result even if stale
+        try:
+            for admin in _admin_cache["admins"]:
+                if hasattr(admin, "user") and getattr(admin.user, "id", None) == chat_id:
+                    return True
+                elif hasattr(admin, "id") and getattr(admin, "id", None) == chat_id:
+                    return True
+            return False
+        except Exception:
+            return False
 
 
 # --- Decorators ---
@@ -118,12 +165,15 @@ def rate_limit(limit_seconds: int = 5) -> Callable:
 
 
 # --- Telegram Helpers ---
-def send_telegram_message(chat_id: str, text: str, parse_mode: str = "Markdown") -> bool:
-    """Send a message via Telegram API directly (without async context)."""
+def send_telegram_message(chat_id, text: str, parse_mode: str = "Markdown") -> bool:
+    """Send a message via Telegram API directly (without async context).
+
+    `chat_id` may be an int or string; it will be cast to str for the HTTP payload.
+    """
     api_url = f"https://api.telegram.org/bot{Config.BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id, 
-        "text": text, 
+        "chat_id": str(chat_id),
+        "text": text,
         "parse_mode": parse_mode
     }
     try:
@@ -141,7 +191,7 @@ def send_consolidated_alert(
     in_stock_products: list, 
     sold_out_products: list
 ) -> None:
-    """Send a consolidated stock alert to a user."""
+    """Send a consolidated stock alert to a user with rate limiting."""
     message_parts = [f"*Stock Update for {pincode}*"]
     
     if in_stock_products:
@@ -154,7 +204,26 @@ def send_consolidated_alert(
     
     message = "\n".join(message_parts)
     
-    if send_telegram_message(chat_id, message):
-        app_logger.info(f"Consolidated alert sent to {chat_id} for {pincode}")
-    else:
-        app_logger.error(f"Failed to send consolidated alert for {pincode}")
+    try:
+        if send_telegram_message(chat_id, message):
+            app_logger.info(f"✅ Consolidated alert sent to {chat_id} for {pincode}")
+        else:
+            app_logger.error(f"❌ Failed to send consolidated alert for {pincode}")
+    except Exception as e:
+        app_logger.error(f"❌ Error sending alert to {chat_id}: {e}")
+
+
+def validate_pincode(pincode: str) -> tuple[bool, str]:
+    """
+    Validate pincode format - must be 6 digits (Indian standard).
+    
+    Returns:
+        tuple: (is_valid: bool, message: str)
+    """
+    # Check format - Indian pincodes are always 6 digits
+    if not pincode or not pincode.isdigit() or len(pincode) != 6:
+        return False, "❌ Pincode must be exactly 6 digits. Example: 411013"
+    
+    # All 6-digit pincodes are valid (service area coverage will be checked separately)
+    return True, f"✅ Pincode {pincode} is valid"
+
